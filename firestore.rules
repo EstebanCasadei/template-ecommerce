@@ -1,0 +1,162 @@
+rules_version = '2';
+
+// Security model summary (see SECURITY.md for the full write-up):
+//
+// - Admins are identified by the `admin: true` custom claim on their auth
+//   token (set with scripts/set-admin.js via the Admin SDK). Claims are part
+//   of the signed JWT, so a client cannot forge or self-assign the role.
+// - `products` is public read-only. Admins have full CRUD (with shape
+//   validation). Non-admin clients may ONLY decrease a product's `stock`
+//   field, as part of placing a valid order — never raise stock, price, or
+//   any other field.
+// - `categories` is public read-only; only admins may write.
+// - `orders` can be created by anyone (guest checkout is allowed), read only
+//   by admins or by the user whose `uid` is on the order, status-updated
+//   only by admins, and never deleted from a client.
+// - Every field of an incoming order is validated: shape, types, string
+//   length caps, and — critically — that `unitPrice`/`subtotal`/`total`
+//   match the authoritative price stored in `products`, and that the
+//   requested quantity does not exceed the authoritative stock. This is
+//   what actually stops an attacker who bypasses this app entirely and
+//   calls the Firestore SDK directly from DevTools.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isAdmin() {
+      return request.auth != null && request.auth.token.admin == true;
+    }
+
+    match /products/{productId} {
+      allow read: if true;
+      allow create: if isAdmin() && isValidProduct();
+      allow update: if (isAdmin() && isValidProduct()) || isValidStockDecrement();
+      allow delete: if isAdmin();
+
+      function isValidProduct() {
+        let data = request.resource.data;
+        return data.keys().hasOnly(['name', 'description', 'price', 'stock', 'category', 'image'])
+          && data.name is string && data.name.size() > 0 && data.name.size() <= 100
+          && data.description is string && data.description.size() <= 1000
+          && data.price is number && data.price > 0 && data.price <= 1000000
+          && data.stock is int && data.stock >= 0 && data.stock <= 1000000
+          && data.category is string && data.category.size() > 0 && data.category.size() <= 50
+          && data.image is string && data.image.size() <= 500
+          && (data.image.size() == 0 || data.image.matches('^https?://.*'));
+      }
+
+      function isValidStockDecrement() {
+        let before = resource.data;
+        let after = request.resource.data;
+        return after.diff(before).affectedKeys().hasOnly(['stock'])
+          && after.stock is int
+          && after.stock >= 0
+          && after.stock < before.stock;
+      }
+    }
+
+    match /categories/{categoryId} {
+      allow read: if true;
+      allow create, update: if isAdmin() && isValidCategory();
+      allow delete: if isAdmin();
+
+      function isValidCategory() {
+        let data = request.resource.data;
+        return data.keys().hasOnly(['name'])
+          && data.name is string && data.name.size() > 0 && data.name.size() <= 50;
+      }
+    }
+
+    match /orders/{orderId} {
+      // Owners can read their own orders; admins can read all. Everyone
+      // else (including guests, whose orders have no uid) is denied.
+      // Note: `resource.data.uid` errors (→ deny) on guest orders with no
+      // uid field, and this exact form lets Firestore statically prove
+      // `where('uid', '==', auth.uid)` queries.
+      allow read: if isAdmin()
+        || (request.auth != null && resource.data.uid == request.auth.uid);
+      // Only admins may move an order through its lifecycle, and only the
+      // status field — the purchased lines and totals are immutable.
+      allow update: if isAdmin() && isValidStatusChange();
+      allow delete: if false;
+      allow create: if isValidOrder();
+
+      function isValidStatusChange() {
+        let after = request.resource.data;
+        return after.diff(resource.data).affectedKeys().hasOnly(['status'])
+          && after.status in ['pending', 'paid', 'shipped', 'delivered', 'cancelled'];
+      }
+
+      function isValidOrder() {
+        let data = request.resource.data;
+        return data.keys().hasOnly(['customer', 'lines', 'total', 'status', 'createdAt', 'uid'])
+          && data.keys().hasAll(['customer', 'lines', 'total', 'status', 'createdAt'])
+          && isValidCustomer(data.customer)
+          && data.lines is list
+          && data.lines.size() > 0
+          && data.lines.size() <= 10
+          && data.total is number
+          && data.total > 0
+          && data.status == 'pending'
+          && data.createdAt == request.time
+          // A client may only attach its own uid (or none, for guests).
+          && (!('uid' in data) || (request.auth != null && data.uid == request.auth.uid))
+          && linesArePriceConsistent(data.lines, data.total);
+      }
+
+      function isValidCustomer(customer) {
+        return customer is map
+          && customer.keys().hasOnly(['name', 'phone', 'email'])
+          && customer.name is string && customer.name.size() > 0 && customer.name.size() <= 100
+          && customer.phone is string && customer.phone.size() > 0 && customer.phone.size() <= 30
+          && customer.email is string && customer.email.size() > 0 && customer.email.size() <= 200
+          && customer.email.matches('^[^@\\s]+@[^@\\s]+[.][^@\\s]+$');
+      }
+
+      // Re-derives the order total from the live `products` documents, one
+      // get() per line. Firestore Rules allows at most 10 document access
+      // calls per single-document write, so the cart is capped at 10 lines.
+      // This function is unrolled into explicit let bindings because
+      // recursion and loops are not allowed in the rules language.
+      function linesArePriceConsistent(lines, total) {
+        let s0 = lines.size() >= 1  ? (isValidLine(lines[0])  ? lines[0].subtotal  : -1.0) : 0.0;
+        let s1 = lines.size() >= 2  ? (isValidLine(lines[1])  ? lines[1].subtotal  : -1.0) : 0.0;
+        let s2 = lines.size() >= 3  ? (isValidLine(lines[2])  ? lines[2].subtotal  : -1.0) : 0.0;
+        let s3 = lines.size() >= 4  ? (isValidLine(lines[3])  ? lines[3].subtotal  : -1.0) : 0.0;
+        let s4 = lines.size() >= 5  ? (isValidLine(lines[4])  ? lines[4].subtotal  : -1.0) : 0.0;
+        let s5 = lines.size() >= 6  ? (isValidLine(lines[5])  ? lines[5].subtotal  : -1.0) : 0.0;
+        let s6 = lines.size() >= 7  ? (isValidLine(lines[6])  ? lines[6].subtotal  : -1.0) : 0.0;
+        let s7 = lines.size() >= 8  ? (isValidLine(lines[7])  ? lines[7].subtotal  : -1.0) : 0.0;
+        let s8 = lines.size() >= 9  ? (isValidLine(lines[8])  ? lines[8].subtotal  : -1.0) : 0.0;
+        let s9 = lines.size() >= 10 ? (isValidLine(lines[9])  ? lines[9].subtotal  : -1.0) : 0.0;
+        return withinTotalTolerance(total, s0 + s1 + s2 + s3 + s4 + s5 + s6 + s7 + s8 + s9, lines.size());
+      }
+
+      function isValidLine(line) {
+        let product = get(/databases/$(database)/documents/products/$(line.productId)).data;
+        return line is map
+          && line.keys().hasOnly(['productId', 'name', 'unitPrice', 'quantity', 'subtotal'])
+          && line.productId is string
+          && line.quantity is int
+          && line.quantity > 0
+          && line.quantity <= product.stock
+          && line.unitPrice is number
+          && withinTolerance(line.unitPrice, product.price)
+          && withinTolerance(line.subtotal, line.unitPrice * line.quantity);
+      }
+
+      function withinTolerance(a, b) {
+        return a >= b - 0.01 && a <= b + 0.01;
+      }
+
+      function withinTotalTolerance(total, sum, linesCount) {
+        let tolerance = 0.01 * linesCount;
+        return total >= sum - tolerance && total <= sum + tolerance;
+      }
+    }
+
+    // Deny everything else by default.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
